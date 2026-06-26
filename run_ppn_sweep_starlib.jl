@@ -10,21 +10,24 @@ Base.@kwdef mutable struct SweepOptions
     baseline_only::Bool = false
     build_only::Bool = false
     apply_network_edits::Bool = false
-    runs_name::String = "runs"
+    starlib_option::Int = 1
+    runs_name::String = "runs_star"
 end
 
 function usage()
     println("""
 Usage:
-  julia tools/run_ppn_sweep.jl [options]
+  julia tools/run_ppn_sweep_starlib.jl [options]
 
 Options:
   --nova NAME             Nova directory under nova_cases/ (default: nova_test)
   --jobs N               Maximum concurrent ppn jobs (default: MAX_JOBS or 4)
-  --baseline-only        Build and run only runs/baseline
+  --baseline-only        Build and run only runs_star/baseline
   --build-only           Rebuild runs but do not execute ppn.exe
   --apply-network-edits  Apply config/network_edits.json before building
-  --runs-name NAME       Output runs directory under the nova case (default: runs)
+  --starlib-option N     STARLIB option to write into ppn_physics.input:
+                         1 = MC10/MC13 STL01, 2 = TALYS/ATOMKI STL02 (default: 1)
+  --runs-name NAME       Output runs directory under the nova case (default: runs_star)
   -h, --help             Show this help
 """)
 end
@@ -49,6 +52,11 @@ function parse_args(args)
             opts.build_only = true
         elseif arg == "--apply-network-edits"
             opts.apply_network_edits = true
+        elseif arg == "--starlib-option"
+            i += 1
+            i <= length(args) || error("--starlib-option requires a value")
+            opts.starlib_option = parse(Int, args[i])
+            opts.starlib_option in (1, 2) || error("--starlib-option must be 1 or 2")
         elseif arg == "--runs-name"
             i += 1
             i <= length(args) || error("--runs-name requires a value")
@@ -86,6 +94,36 @@ function list_ppn_executables(runs_dir; baseline_only=false)
     sort!(exes)
     isempty(exes) && error("No ppn.exe files found under $runs_dir")
     return exes
+end
+
+function set_starlib_option!(path, option)
+    lines = readlines(path, keep=true)
+    changed = false
+    for i in eachindex(lines)
+        if occursin(r"(?i)^\s*starlib_option\s*=", lines[i])
+            lines[i] = replace(lines[i], r"(?i)^(\s*starlib_option\s*=\s*)\d+" => SubstitutionString("\\g<1>$option"); count=1)
+            changed = true
+            break
+        end
+    end
+    if !changed
+        insert_at = findfirst(line -> strip(line) == "/", lines)
+        insert_at === nothing && error("Could not find ppn_physics namelist terminator in $path")
+        insert!(lines, insert_at, "        starlib_option = $option\n")
+    end
+    write(path, join(lines))
+end
+
+function enable_starlib_in_runs!(runs_dir, option)
+    count = 0
+    for (root, _, files) in walkdir(runs_dir)
+        if "ppn_physics.input" in files
+            set_starlib_option!(joinpath(root, "ppn_physics.input"), option)
+            count += 1
+        end
+    end
+    count > 0 || error("No ppn_physics.input files found under $runs_dir")
+    println("Enabled starlib_option=$option in $count ppn_physics.input file(s).")
 end
 
 function run_and_log(cmd::Cmd, logfile)
@@ -167,13 +205,14 @@ function rebuild_runs(opts::SweepOptions)
     end
 
     if ispath(runs_dir)
-        println("Deleting existing runs directory: $runs_dir")
+        println("Deleting existing STARLIB runs directory: $runs_dir")
         rm(runs_dir; recursive=true)
     else
-        println("No existing runs directory found; building fresh runs.")
+        println("No existing STARLIB runs directory found; building fresh runs.")
     end
 
     create_factored_runs(opts.nova; baseline_only=opts.baseline_only, runs_name=opts.runs_name)
+    enable_starlib_in_runs!(runs_dir, opts.starlib_option)
     return runs_dir
 end
 
@@ -187,7 +226,7 @@ function main()
     ENV["VECLIB_MAXIMUM_THREADS"] = get(ENV, "VECLIB_MAXIMUM_THREADS", "1")
 
     base = NovaRunTools.nova_dir(opts.nova)
-    logs_dir = joinpath(base, "logs")
+    logs_dir = joinpath(base, "logs_$(opts.runs_name)")
     mkpath(logs_dir)
 
     global_start = time()
@@ -199,13 +238,13 @@ function main()
     end
 
     exes = list_ppn_executables(runs_dir; baseline_only=opts.baseline_only)
-    println("Starting $(length(exes)) ppn run(s) with up to $(opts.jobs) concurrent job(s).")
+    println("Starting $(length(exes)) STARLIB ppn run(s) with up to $(opts.jobs) concurrent job(s).")
 
     run_parallel(exes, runs_dir, logs_dir, opts.jobs)
 
     elapsed = round(Int, time() - global_start)
     println("==================================================")
-    println("ALL REQUESTED RUNS COMPLETE")
+    println("ALL REQUESTED STARLIB RUNS COMPLETE")
     println("Total time: $elapsed seconds")
     println("==================================================")
 end

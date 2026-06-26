@@ -671,6 +671,7 @@ function validate_plan(network, config)
     selected = []
     for reaction in config["reactions"]
         candidates, product_was_remapped = matching_rows_for_reaction(reaction, network)
+        product_was_remapped = product_was_remapped || get(reaction, "product_was_remapped", false)
         isempty(candidates) && error("$(reaction["name"]): no matching row in networksetup.txt")
         row = select_configured_row(reaction, candidates)
         row === nothing && error("$(reaction["name"]): configured index $(getkey(reaction, "index")) was not found among matching rows")
@@ -725,6 +726,7 @@ end
 
 function resolve_reaction_index(reaction, network)
     candidates, product_was_remapped = matching_rows_for_reaction(reaction, network)
+    product_was_remapped = product_was_remapped || get(reaction, "product_was_remapped", false)
     isempty(candidates) && error("$(reaction["name"]): could not resolve reaction in networksetup.txt")
     selected = select_configured_row(reaction, candidates)
     selected === nothing && error("$(reaction["name"]): configured index $(getkey(reaction, "index")) was not found")
@@ -761,10 +763,10 @@ function write_physics_input(ppn_dir, run_dir, indices, factors)
     write(output, join(new_lines))
 end
 
-function create_factored_runs(nova; baseline_only=false, dry_run=false)
+function create_factored_runs(nova; baseline_only=false, dry_run=false, runs_name="runs")
     base = nova_dir(nova)
     ppn_dir = joinpath(base, "ppn")
-    runs_dir = joinpath(base, "runs")
+    runs_dir = joinpath(base, runs_name)
     plan_path = joinpath(base, "config", "reaction_plan.json")
     network_path = joinpath(ppn_dir, "networksetup.txt")
     config = parse_json_file(plan_path)

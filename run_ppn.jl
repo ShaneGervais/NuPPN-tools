@@ -6,6 +6,7 @@ using Dates
 using Printf
 
 const ROOT = dirname(@__DIR__)
+const PROJECT_ROOT = dirname(ROOT)
 const DEFAULT_CASES_CONFIG = joinpath(ROOT, "config", "iliadis2002_model_cases.json")
 const NETWORK_MODES = Set(["generated", "fixed"])
 
@@ -19,6 +20,7 @@ Base.@kwdef mutable struct Options
     dry_run::Bool = false
     flux::Bool = false
     network_mode::String = "generated"
+    starlib_option::Int = 0
 end
 
 function usage()
@@ -36,7 +38,8 @@ Options:
   --dry-run             Resolve and print planned runs without writing directories
   --flux                Enable flux_*.DAT output in ppn_frame.input
   --network-mode MODE   Network handling: generated writes a fresh networksetup.txt (ININET=0);
-                        fixed reads the copied networksetup.txt (ININET=3). Default: generated
+                        fixed prepares ININET=3 inputs for build-only inspection. Default: generated
+  --starlib-option N    STARLIB_OPTION value written to ppn_physics.input. Default: 0
   -h, --help            Show this help
 """)
 end
@@ -74,6 +77,11 @@ function parse_args(args)
             i <= length(args) || error("--network-mode requires a value")
             opts.network_mode = lowercase(args[i])
             opts.network_mode in NETWORK_MODES || error("--network-mode must be one of: $(join(sort(collect(NETWORK_MODES)), ", "))")
+        elseif arg == "--starlib-option"
+            i += 1
+            i <= length(args) || error("--starlib-option requires a value")
+            opts.starlib_option = parse(Int, args[i])
+            opts.starlib_option >= 0 || error("--starlib-option must be >= 0")
         elseif arg in ("-h", "--help")
             usage()
             exit(0)
@@ -126,11 +134,29 @@ function case_input_paths(case_name)
     return case_dir, trajectory, initial
 end
 
-function force_ininet!(path, value)
+function force_namelist_int!(path, key, value)
     text = read(path, String)
-    new_text = replace(text, r"(?im)^(\s*ININET\s*=\s*)\d+" => SubstitutionString("\\g<1>$value"); count=1)
+    pattern = Regex("(?im)^(\\s*$(key)\\s*=\\s*)\\d+")
+    new_text = replace(text, pattern => SubstitutionString("\\g<1>$value"); count=1)
+    if new_text == text
+        lines = readlines(path, keep=true)
+        inserted = false
+        out = String[]
+        for line in lines
+            if !inserted && strip(line) == "/"
+                push!(out, "        $key = $value\n")
+                inserted = true
+            end
+            push!(out, line)
+        end
+        inserted || error("Could not find ppn_physics namelist terminator in $path")
+        new_text = join(out)
+    end
     write(path, new_text)
 end
+
+force_ininet!(path, value) = force_namelist_int!(path, "ININET", value)
+force_starlib_option!(path, value) = force_namelist_int!(path, "STARLIB_OPTION", value)
 
 function set_flux_option!(path, enabled)
     text = read(path, String)
@@ -139,17 +165,19 @@ function set_flux_option!(path, enabled)
     write(path, new_text)
 end
 
-function replace_last_numeric(line, value)
+function replace_rate_factor_column(line, value)
     eol = endswith(line, "\n") ? "\n" : ""
     body = chomp(line)
-    replace(body, r"\s+[-+]?\d+(?:\.\d*)?(?:[EeDd][+-]?\d+)?$" => " $value"; count=1) * eol
+    # Reaction rows end with rfac followed by bind_energy_diff; preserve the final Q-value field.
+    pattern = r"(\s+)[-+]?\d+(?:\.\d*)?(?:[EeDd][+-]?\d+)?(\s+[-+]?\d+(?:\.\d*)?(?:[EeDd][+-]?\d+)?\s*)$"
+    replace(body, pattern => SubstitutionString("\\g<1>$value\\g<2>"); count=1) * eol
 end
 
 function reset_network_factors!(path)
     lines = readlines(path, keep=true)
     network = parse_networksetup(path)
     for row in network
-        lines[row.line_no] = replace_last_numeric(lines[row.line_no], "1.000E+00")
+        lines[row.line_no] = replace_rate_factor_column(lines[row.line_no], "1.000E+00")
     end
     write(path, join(lines))
 end
@@ -165,7 +193,7 @@ function set_network_factors!(path, factors_by_index)
             push!(missing, idx)
             continue
         end
-        lines[row.line_no] = replace_last_numeric(lines[row.line_no], @sprintf("%.3E", factor))
+        lines[row.line_no] = replace_rate_factor_column(lines[row.line_no], @sprintf("%.3E", factor))
     end
     isempty(missing) || error("Missing networksetup indices: $(join(missing, ", "))")
     write(path, join(lines))
@@ -205,6 +233,15 @@ function row_by_name(network, reaction)
     isempty(candidates) ? nothing : sort(candidates, by=row -> row.index)[1]
 end
 
+function npdata_source_path()
+    project_npdata = joinpath(PROJECT_ROOT, "NPDATA")
+    if ispath(project_npdata)
+        return realpath(project_npdata)
+    end
+
+    return realpath(joinpath(ROOT, "..", "..", "physics", "NPDATA"))
+end
+
 function run_label(reaction, factor)
     label = if haskey(reaction, "name")
         reaction["name"]
@@ -218,9 +255,9 @@ function run_label(reaction, factor)
     return clean_label, "factor_$factor_label"
 end
 
-function copy_common_inputs!(run_dir, trajectory, initial; flux=false, network_mode="generated")
+function copy_common_inputs!(run_dir, trajectory, initial; flux=false, network_mode="generated", starlib_option=0)
     mkpath(run_dir)
-    npdata_src = realpath(joinpath(ROOT, "..", "..", "physics", "NPDATA"))
+    npdata_src = npdata_source_path()
     parent_npdata = joinpath(dirname(run_dir), "NPDATA")
     if !ispath(parent_npdata)
         symlink(npdata_src, parent_npdata)
@@ -241,25 +278,49 @@ function copy_common_inputs!(run_dir, trajectory, initial; flux=false, network_m
     ispath(exe_link) && rm(exe_link; force=true)
     symlink(joinpath(ROOT, "ppn.exe"), exe_link)
 
-    force_ininet!(joinpath(run_dir, "ppn_physics.input"), network_mode_ininet(network_mode))
+    physics_path = joinpath(run_dir, "ppn_physics.input")
+    force_ininet!(physics_path, network_mode_ininet(network_mode))
+    force_starlib_option!(physics_path, starlib_option)
     set_flux_option!(joinpath(run_dir, "ppn_frame.input"), flux)
     reset_network_factors!(joinpath(run_dir, "networksetup.txt"))
 end
 
-function write_run_manifest!(run_dir, case_config, reaction, factor, indices)
+function write_run_manifest!(run_dir, case_config, reaction, factor, indices; starlib_option=0)
     open(joinpath(run_dir, "run_manifest.json"), "w") do io
         println(io, "{")
         println(io, "  \"nova_case\": \"$(case_config["nova_case"])\",")
         println(io, "  \"iliadis_model\": \"$(get(case_config, "iliadis_model", "unknown"))\",")
         println(io, "  \"reaction\": \"$(get(reaction, "article_reaction", get(reaction, "name", "baseline")))\",")
         println(io, "  \"factor\": $factor,")
+        println(io, "  \"applied_factor\": $(get(reaction, "applied_factor", factor)),")
+        println(io, "  \"baseline_factor\": $(get(reaction, "baseline_factor", 1.0)),")
         println(io, "  \"network_mode\": \"$(get(case_config, "network_mode", "generated"))\",")
+        println(io, "  \"starlib_option\": $starlib_option,")
         println(io, "  \"network_indices\": [$(join(indices, ", "))]")
         println(io, "}")
     end
 end
 
-function build_case(case_config; baseline_only=false, dry_run=false, flux=false, network_mode="generated")
+function baseline_factor(reaction)
+    return Float64(get(reaction, "baseline_factor", 1.0))
+end
+
+function configured_baseline_factors(network, reactions)
+    factors_by_index = Dict{Int,Float64}()
+    for reaction in reactions
+        base = baseline_factor(reaction)
+        base == 1.0 && continue
+        row = row_by_name(network, reaction)
+        row === nothing && continue
+        linked = [Int(i) for i in get(reaction, "linked_indices", Any[])]
+        for idx in vcat([row.index], linked)
+            factors_by_index[idx] = base
+        end
+    end
+    return factors_by_index
+end
+
+function build_case(case_config; baseline_only=false, dry_run=false, flux=false, network_mode="generated", starlib_option=0)
     case_name = case_config["nova_case"]
     case_config["network_mode"] = network_mode
     _, trajectory, initial = case_input_paths(case_name)
@@ -267,19 +328,29 @@ function build_case(case_config; baseline_only=false, dry_run=false, flux=false,
     baseline_dir = joinpath(output_dir, "baseline")
     run_dirs = String[]
 
+    network = parse_networksetup(joinpath(ROOT, "networksetup.txt"))
+    reactions = load_reactions(case_config)
+    baseline_factors_by_index = configured_baseline_factors(network, reactions)
+
     if dry_run
-        println("Would build baseline: $baseline_dir using network mode $network_mode")
+        println("Would build baseline: $baseline_dir using network mode $network_mode starlib_option $starlib_option")
+        if !isempty(baseline_factors_by_index)
+            details = ["$idx => $factor" for (idx, factor) in sort(collect(baseline_factors_by_index))]
+            println("Would apply baseline rate factors: $(join(details, ", "))")
+        end
     else
         ispath(baseline_dir) && rm(baseline_dir; recursive=true)
-        copy_common_inputs!(baseline_dir, trajectory, initial; flux=flux, network_mode=network_mode)
-        write_run_manifest!(baseline_dir, case_config, Dict{String,Any}("article_reaction" => "baseline"), 1.0, Int[])
+        copy_common_inputs!(baseline_dir, trajectory, initial; flux=flux, network_mode=network_mode, starlib_option=starlib_option)
+        if !isempty(baseline_factors_by_index)
+            set_network_factors!(joinpath(baseline_dir, "networksetup.txt"), baseline_factors_by_index)
+            write_physics_rate_factors!(joinpath(baseline_dir, "ppn_physics.input"), baseline_factors_by_index)
+        end
+        write_run_manifest!(baseline_dir, case_config, Dict{String,Any}("article_reaction" => "baseline"), 1.0, collect(keys(baseline_factors_by_index)); starlib_option=starlib_option)
         println("Built baseline: $baseline_dir")
     end
     push!(run_dirs, baseline_dir)
     baseline_only && return run_dirs
 
-    network = parse_networksetup(joinpath(ROOT, "networksetup.txt"))
-    reactions = load_reactions(case_config)
     skipped = Tuple{String,String}[]
 
     for reaction in reactions
@@ -295,17 +366,24 @@ function build_case(case_config; baseline_only=false, dry_run=false, flux=false,
         isempty(factors) && (factors = [get(reaction, "factor", 1.0)])
         for factor_any in factors
             factor = Float64(factor_any)
+            base = baseline_factor(reaction)
+            applied_factor = factor * base
             reaction_dir, factor_dir = run_label(reaction, factor)
             run_dir = joinpath(output_dir, reaction_dir, factor_dir)
             if dry_run
-                println("Would build $run_dir using indices $(join(indices, ", ")) factor $factor network mode $network_mode")
+                println("Would build $run_dir using indices $(join(indices, ", ")) factor $factor applied_factor $applied_factor network mode $network_mode starlib_option $starlib_option")
             else
                 ispath(run_dir) && rm(run_dir; recursive=true)
-                copy_common_inputs!(run_dir, trajectory, initial; flux=flux, network_mode=network_mode)
-                factors_by_index = Dict(idx => factor for idx in indices)
+                copy_common_inputs!(run_dir, trajectory, initial; flux=flux, network_mode=network_mode, starlib_option=starlib_option)
+                factors_by_index = copy(baseline_factors_by_index)
+                for idx in indices
+                    factors_by_index[idx] = applied_factor
+                end
                 set_network_factors!(joinpath(run_dir, "networksetup.txt"), factors_by_index)
                 write_physics_rate_factors!(joinpath(run_dir, "ppn_physics.input"), factors_by_index)
-                write_run_manifest!(run_dir, case_config, reaction, factor, indices)
+                manifest_reaction = copy(reaction)
+                manifest_reaction["applied_factor"] = applied_factor
+                write_run_manifest!(run_dir, case_config, manifest_reaction, factor, sort(collect(keys(factors_by_index))); starlib_option=starlib_option)
             end
             push!(run_dirs, run_dir)
         end
@@ -387,6 +465,9 @@ end
 
 function main()
     opts = parse_args(ARGS)
+    if opts.network_mode == "fixed" && !opts.dry_run && !opts.build_only
+        error("--network-mode fixed is build-only right now because PPN's rnetw2008 exits for ININET=3; use --network-mode generated for executable runs")
+    end
     ENV["OMP_NUM_THREADS"] = get(ENV, "OMP_NUM_THREADS", "1")
     ENV["OPENBLAS_NUM_THREADS"] = get(ENV, "OPENBLAS_NUM_THREADS", "1")
     ENV["MKL_NUM_THREADS"] = get(ENV, "MKL_NUM_THREADS", "1")
@@ -399,7 +480,8 @@ function main()
             baseline_only=opts.baseline_only,
             dry_run=opts.dry_run,
             flux=opts.flux,
-            network_mode=opts.network_mode))
+            network_mode=opts.network_mode,
+            starlib_option=opts.starlib_option))
     end
     opts.dry_run && return
     opts.build_only && return
